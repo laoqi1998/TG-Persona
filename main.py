@@ -415,11 +415,17 @@ def db_init(database=None):
         ("cc_username", "TEXT DEFAULT ''"),
         ("cc_email", "TEXT DEFAULT ''"),
         ("cc_last_code", "TEXT DEFAULT ''"),
+        ("signin_poem_mode", "INTEGER DEFAULT 0"),
+        ("poem_box_wait", "INTEGER DEFAULT 12"),
+        ("poem_delete_on_success", "INTEGER DEFAULT 0"),
     ):
         try:
             conn.execute(f"ALTER TABLE automations ADD COLUMN {col} {ddl}")
         except sqlite3.OperationalError:
             pass
+    # 1.29.51：诗词签到从 BOT 签到中拆成独立任务类型，旧任务自动迁移。
+    conn.execute("UPDATE automations SET type='signin_poem', signin_poem_mode=1 "
+                 "WHERE type='signin' AND signin_poem_mode=1")
     for col, ddl in (("wait_others", "INTEGER DEFAULT 0"), ("wait_timeout", "INTEGER DEFAULT 30"), ("failed", "INTEGER DEFAULT 0")):
         try:
             conn.execute(f"ALTER TABLE game_tasks ADD COLUMN {col} {ddl}")
@@ -5137,9 +5143,13 @@ def _store_learning_samples(samples):
         count = sum((sample[3] if sample[3] in ("owner", "group") else "group") == role for sample in samples)
         if count:
             _learning_metric(role, collected=count)
-    keep = max(1000, _learning_budget("flock_learning_batch_size", AI_FLOCK_LEARNING_MESSAGES) * 5)
-    db.execute("DELETE FROM ai_learning_samples WHERE id NOT IN "
-               "(SELECT id FROM ai_learning_samples ORDER BY id DESC LIMIT ?)", (keep,))
+    batch_size = _learning_budget("flock_learning_batch_size", AI_FLOCK_LEARNING_MESSAGES)
+    # 学习队列只保留最近一段，避免长期失败时无限堆积；主人样本单独保底，不被群消息挤掉。
+    for role, keep in (("owner", max(100, batch_size * 5)), ("group", max(200, batch_size * 10))):
+        db.execute("DELETE FROM ai_learning_samples WHERE role=? AND id NOT IN "
+                   "(SELECT id FROM ai_learning_samples WHERE role=? ORDER BY id DESC LIMIT ?)",
+                   (role, role, keep))
+    db.execute("DELETE FROM ai_learning_samples WHERE role NOT IN ('owner','group')")
     db.commit()
     _schedule_ai_learning()
     return len(samples)
@@ -5695,7 +5705,7 @@ def _is_context_length_error(error):
     return any(token in message for token in (
         "context length", "context_length", "maximum context", "too long", "token limit",
         "max token", "request too large", "http 413", "context window", "prompt is too long",
-        "tokens exceed", "上下文", "长度超限"))
+        "tokens exceed", "上下文", "长度超限", "输出达到本次上限"))
 
 
 async def _upload_flock_skill():
@@ -7426,6 +7436,243 @@ async def _await_task_button(ent, min_id, keyword, timeout=30, mode="script", hi
     return None, None
 
 
+SIGNIN_TASK_TYPES = ("signin", "signin_poem")
+
+
+def _is_signin_type(value):
+    return str(value or "") in ("signin", "signin_poem")
+
+
+def _signin_poem_mode(a):
+    try:
+        if str(a["type"]) == "signin_poem":
+            return True
+    except (KeyError, IndexError, TypeError):
+        pass
+    try:
+        return bool(int(a["signin_poem_mode"] or 0))
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False
+
+
+def _blindbox_result(text):
+    """盲盒回调/消息状态：success=领到，already=已领/失效，failed=明确失败。"""
+    body = str(text or "")
+    if any(word in body for word in ("已被领取", "已经领取", "已领取", "失效", "来晚了", "领过了")):
+        return "already"
+    if any(word in body for word in ("失败", "错误", "无效", "过期", "稍后再试")):
+        return "failed"
+    if any(word in body for word in ("恭喜", "领取成功", "领取到", "获得", "随机奖励", "奖励已")):
+        return "success"
+    return "unknown"
+
+
+def _poem_box_button(buttons, keyword="盲盒", emoji="🎁"):
+    """只选回调按钮。不碰 URL/网页按钮，避免把群消息里的外链当成盲盒。"""
+    keywords = [x.strip() for x in re.split(r"[,，\s]", str(keyword or "盲盒")) if x.strip()]
+    emojis = [_norm_emoji(x) for x in re.split(r"[,，\s]", str(emoji or "")) if _norm_emoji(x)]
+    for row in (buttons or []):
+        for button in row or []:
+            if getattr(button, "data", None) is None:
+                continue
+            text = str(getattr(button, "text", "") or "")
+            if any(word in text for word in ("已被领取", "已经领取", "已领取", "失效")):
+                continue
+            normalized = _norm_emoji(text)
+            if emojis and any(icon in normalized for icon in emojis):
+                return button
+            if any(word in text for word in keywords):
+                return button
+    return None
+
+
+async def _message_buttons(message):
+    try:
+        return await message.get_buttons() or []
+    except Exception:
+        return getattr(message, "buttons", None) or []
+
+
+def _pick_library_poem_pair():
+    """从古诗填空 OCR 的同一份诗库随机抽一联：优先五言/七言，整句无标点、无缺字标记。"""
+    lines = _poem_load() or []
+    if not lines:
+        return None
+    for _ in range(300):
+        line = random.choice(lines)
+        if len(line) not in (10, 14):
+            continue
+        half = len(line) // 2
+        first, second = line[:half], line[half:]
+        if all("\u4e00" <= ch <= "\u9fff" for ch in first + second):
+            return first, second
+    return None
+
+
+async def _run_poem_group_signin(a):
+    """群诗词签到：从内置诗库随机一联，连同触发词分三条发送；只认回复我们这三条的消息。"""
+    target = str(a["target"] or "").strip()
+    pair = _pick_library_poem_pair()
+    final = str(a["keywords"] or "").strip()
+    if not all((target, final)) or pair is None:
+        return _task_failure(a, "诗词群签到缺少目标/触发词，或内置诗库暂不可用")
+    first, second = pair
+    ent = await resolve_entity(target)
+    if ent is None:
+        return _task_failure(a, "诗词群签到目标解析失败", first)
+    sent_ids = []
+    sent_messages = []
+    try:
+        for index, text in enumerate((first, second, final)):
+            message = await _send_generated_message(ent, text)
+            sent_ids.append(int(message.id))
+            sent_messages.append(message)
+            if index < 2:
+                await asyncio.sleep(max(0.0, float(a["command_delay"] or 0)))
+    except errors.FloodWaitError as error:
+        raise _RetryLater(error.seconds) from error
+    except Exception as error:
+        return _task_failure(a, "诗词群签到发送失败: %s" % error, first)
+
+    success_kw = str(a["success_kw"] or "").strip()
+    fail_kw = str(a["fail_kw"] or "").strip()
+    points_pat = str(a["points_pat"] or "").strip()
+    need_box = bool(a["click_btn"])
+    box_kw = str(a["btn_text"] or "盲盒").strip() or "盲盒"
+    box_emoji = str(a["btn_emoji"] or "🎁").strip()
+    box_wait = max(0, min(120, int(a["poem_box_wait"] if "poem_box_wait" in a.keys() else 12)))
+    timeout = max(1, min(300, int(a["result_timeout"] or 30)))
+    deadline = time.monotonic() + timeout
+    success_text, fail_text, last_text = "", "", ""
+    box_message, box_button = None, None
+
+    def own_reply(message):
+        return (not getattr(message, "out", False)
+                and getattr(message, "reply_to_msg_id", None) is not None
+                and int(getattr(message, "reply_to_msg_id")) in sent_ids)
+
+    async def scan_messages(need_success):
+        nonlocal success_text, fail_text, last_text, box_message, box_button
+        try:
+            messages = await get_runtime().client.get_messages(ent, limit=24)
+        except errors.FloodWaitError:
+            raise
+        except Exception:
+            return False
+        for message in sorted(messages, key=lambda item: getattr(item, "id", 0)):
+            if not own_reply(message):
+                continue
+            text = str(getattr(message, "raw_text", "") or "").strip()
+            if text:
+                last_text = text
+            if need_success and text:
+                if _signin_succeeded(text, success_kw):
+                    success_text = text
+                    return True
+                if _signin_failed(text, fail_kw):
+                    fail_text = text
+                    return True
+            if need_box and box_message is None:
+                button = _poem_box_button(await _message_buttons(message), box_kw, box_emoji)
+                if button is not None:
+                    box_message, box_button = message, button
+        return False
+
+    while time.monotonic() < deadline:
+        if await scan_messages(True):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(0.8, remaining))
+
+    # 签到成功后盲盒可能晚几秒才由另一个 bot 回复我们的诗句；只在额外窗口里继续找。
+    if need_box and box_button is None and not fail_text:
+        box_deadline = time.monotonic() + box_wait
+        while True:
+            await scan_messages(False)
+            if box_button is not None or time.monotonic() >= box_deadline:
+                break
+            await asyncio.sleep(min(0.5, max(0.0, box_deadline - time.monotonic())))
+
+    box_state, box_popup, box_button_text = "", "", ""
+    if need_box and box_button is not None:
+        box_button_text = str(getattr(box_button, "text", "") or "")
+        try:
+            answer = await box_button.click()
+            box_popup = str(getattr(answer, "message", answer if isinstance(answer, str) else "") or "").strip()
+            box_state = _blindbox_result(box_popup) if box_popup else "clicked"
+        except errors.FloodWaitError as error:
+            raise _RetryLater(error.seconds) from error
+        except Exception as error:
+            box_state = "click_failed"
+            box_popup = str(error)[:120]
+    elif need_box:
+        box_state = "not_found"
+
+    deleted, delete_errors = [], []
+    if success_text:
+        try:
+            delete_on_success = bool(int(a["poem_delete_on_success"] if "poem_delete_on_success" in a.keys() else 0))
+        except (TypeError, ValueError):
+            delete_on_success = False
+        if delete_on_success:
+            for message in sent_messages[:2]:
+                try:
+                    if hasattr(message, "delete"):
+                        await message.delete()
+                    else:
+                        await get_runtime().client.delete_messages(ent, [message.id])
+                    deleted.append(int(message.id))
+                except Exception as error:
+                    delete_errors.append("%s: %s" % (getattr(message, "id", "?"), error))
+            log.info("诗词群签到成功后删除两句诗词 任务=%s 已删=%s 失败=%s",
+                     a["name"], deleted, delete_errors[:2])
+
+    points = ""
+    if points_pat and success_text:
+        try:
+            match = re.search(points_pat, success_text)
+            if match:
+                points = match.group(1) if match.groups() else match.group(0)
+        except re.error:
+            pass
+
+    detail = {"kind": "signin", "task": a["name"], "bot": target, "mode": "poem_group",
+              "sent_messages": sent_ids, "first": first, "second": second, "final": final,
+              "poem_source": "library",
+              "reply": success_text or fail_text or last_text, "points": points,
+              "box": box_state, "box_button": box_button_text, "box_reply": box_popup,
+              "deleted_messages": deleted, "delete_errors": delete_errors,
+              "command_delay": a["command_delay"], "result_timeout": timeout,
+              "poem_box_wait": box_wait}
+    if fail_text and not success_text:
+        detail["error"] = "机器人回复失败：" + fail_text[:120]
+        add_hit("signin", False, chat_id=target, rule_id=-a["id"], grp_name=a["name"],
+                content=final, reply=fail_text, detail=detail)
+        _notify_task_failure(a, "诗词签到失败：" + fail_text[:120])
+        return False
+    if not success_text:
+        detail["error"] = "等待机器人回复超时，未确认签到结果"
+        return _task_unconfirmed(a, "诗词签到等待回复超时，结果未知；请检查群内实际结果", final, last_text, detail)
+
+    desc = "诗词签到成功"
+    if points:
+        desc += " · 积分 " + str(points)
+    if box_state == "success":
+        desc += " · 盲盒已领取"
+    elif box_state == "already":
+        desc += " · 盲盒已被领取/失效"
+    elif box_state == "click_failed":
+        desc += " · 盲盒点击失败"
+    detail["note"] = desc
+    add_hit("signin", True, chat_id=target, rule_id=-a["id"], grp_name=a["name"],
+            content=final, reply=success_text, detail=detail)
+    _notify_signin_success(a, desc + " · " + target)
+    log.info("诗词群签到成功 任务=%s 群=%s 积分=%s 盲盒=%s", a["name"], target, points, box_state or "未触发")
+    return True
+
+
 def _signin_recognition_mode(task):
     try:
         mode = str(task["signin_recognition_mode"] or "").strip()
@@ -7441,6 +7688,8 @@ def _signin_recognition_mode(task):
 
 async def run_signin(a):
     """单次签到尝试;重试/成功时间由统一执行器管理,不在协程内无限重发。"""
+    if _signin_poem_mode(a):
+        return await _run_poem_group_signin(a)
     target = str(a["target"] or "").strip()
     cmd = _pick_cmd(a["command"])
     if not target or not cmd:
@@ -8937,7 +9186,7 @@ def _reset_auto_schedule(aid, clear_success=False):
     # 时间、重试设置、启停或图标变化不能重新发放当天重试额度。
     if not clear_success and (a["last_attempt"] or a["last_status"] == "unconfirmed"):
         next_at = int(a["next_run_at"] or 0)
-        if a["type"] == "signin":
+        if _is_signin_type(a["type"]):
             if a["last_status"] in ("success", "unconfirmed") or a["retry_count"] >= _retry_limit(a):
                 next_at = 0
         elif a["type"] == "keepalive":
@@ -8971,14 +9220,14 @@ def _global_signin_window():
 
 def _effective_signin_window(a):
     window = _global_signin_window()
-    follows = window["enabled"] and a["type"] == "signin" and not a["signin_independent"]
+    follows = window["enabled"] and _is_signin_type(a["type"]) and not a["signin_independent"]
     return (window["start"], window["end"]) if follows else (a["win_start"], a["win_end"])
 
 
 def _signin_windows(a):
     first = _effective_signin_window(a)
     windows = [first]
-    if a["type"] == "signin" and a["signin_second_enabled"]:
+    if _is_signin_type(a["type"]) and a["signin_second_enabled"]:
         windows.append((a["signin_second_start"], a["signin_second_end"]))
     return windows
 
@@ -9037,7 +9286,7 @@ def _maybe_notify_global_signin_summary():
     if get_setting("signin_summary_day", "") == today:
         return False
     rows = get_account_db().execute(
-        "SELECT * FROM automations WHERE enabled=1 AND type='signin' AND signin_independent=0 ORDER BY id DESC").fetchall()
+        "SELECT * FROM automations WHERE enabled=1 AND type IN ('signin','signin_poem') AND signin_independent=0 ORDER BY id DESC").fetchall()
     if not rows:
         return False
     runtime = _auto_runtime_state()
@@ -9273,7 +9522,7 @@ async def _execute_auto_body(aid, manual=False, trigger_context=None):
         a = get_account_db().execute("SELECT * FROM automations WHERE id=?", (aid,)).fetchone()
         if a is None or (not manual and not a["enabled"]):
             return result
-        notice["aggregate"] = bool(not manual and a["type"] == "signin"
+        notice["aggregate"] = bool(not manual and _is_signin_type(a["type"])
                                    and _global_signin_window()["enabled"] and not a["signin_independent"])
         if get_runtime().client is None or get_runtime().tg_state["phase"] != "ready":
             return result
@@ -9281,10 +9530,10 @@ async def _execute_auto_body(aid, manual=False, trigger_context=None):
         current = now_local()
         today = current.strftime("%Y-%m-%d")
         signin_slot = (_signin_slot(a, current, allow_outside=manual, success_mask=_signin_mask(a, today))
-                       if a["type"] == "signin" else -1)
+                       if _is_signin_type(a["type"]) else -1)
         count = int(a["retry_count"] or 0)
         if not manual:
-            if a["type"] == "signin":
+            if _is_signin_type(a["type"]):
                 if signin_slot is None or _signin_mask(a, today) & (1 << signin_slot):
                     return result
                 same_slot = (a["retry_day"] == today
@@ -9294,7 +9543,7 @@ async def _execute_auto_body(aid, manual=False, trigger_context=None):
                     return result
             if a["type"] == "keepalive" and now < int(a["next_run_at"] or 0):
                 return result
-        if a["type"] == "signin" and (a["retry_day"] != today
+        if _is_signin_type(a["type"]) and (a["retry_day"] != today
                 or int(a["signin_attempt_slot"] if a["signin_attempt_slot"] is not None else -1) != signin_slot):
             count = 0
         if a["type"] == "keepalive" and count >= _retry_limit(a):
@@ -9308,7 +9557,7 @@ async def _execute_auto_body(aid, manual=False, trigger_context=None):
         a = get_account_db().execute("SELECT * FROM automations WHERE id=?", (aid,)).fetchone()
         ok, status = False, "failed"
         try:
-            if a["type"] == "signin":
+            if _is_signin_type(a["type"]):
                 if manual:
                     ok = bool(await run_signin(a))
                 else:
@@ -9350,15 +9599,15 @@ async def _execute_auto_body(aid, manual=False, trigger_context=None):
                 status = "unconfirmed"
             next_at = finished + backoff
             exhausted = count >= _retry_limit(a)
-            if a["type"] == "signin" and (exhausted or status in ("unconfirmed", "stopped")):
+            if _is_signin_type(a["type"]) and (exhausted or status in ("unconfirmed", "stopped")):
                 next_at = 0
             if status == "stopped":
                 next_at = 0
                 get_account_db().execute("UPDATE automations SET next_run_at=0,last_status='stopped' WHERE id=?", (aid,))
             elif ok:
-                stamp = now_local().strftime("%Y-%m-%d") if a["type"] == "signin" else str(finished)
+                stamp = now_local().strftime("%Y-%m-%d") if _is_signin_type(a["type"]) else str(finished)
                 next_at = finished + max(60, int(a["poll_interval"] or 60)) if a["type"] == "keepalive" else 0
-                if a["type"] == "signin":
+                if _is_signin_type(a["type"]):
                     previous_mask = _signin_mask(a, today)
                     success_mask = previous_mask | (1 << max(0, signin_slot))
                     get_account_db().execute("UPDATE automations SET last_at=?,signin_success_mask=?,retry_count=0,next_run_at=?,"
@@ -9379,7 +9628,7 @@ async def _execute_auto_body(aid, manual=False, trigger_context=None):
                 except ValueError:
                     pass
             retry = (not manual and not ok and status == "failed" and not exhausted and
-                     (a["type"] in ("signin", "keepalive") or (a["type"] == "custom" and retry_later))
+                     (a["type"] in ("signin", "signin_poem", "keepalive") or (a["type"] == "custom" and retry_later))
                      and aid not in _auto_runtime_state().auto_stop_requested)
             if a["type"] == "scheduled_register" or (custom_schedule and not retry and status != "interrupted"):
                 get_account_db().execute("UPDATE automations SET enabled=0,next_run_at=0 WHERE id=?", (aid,))
@@ -9419,7 +9668,7 @@ def _signin_tick():
     for key in list(get_runtime().signin_plans):
         if key[1] != today:
             get_runtime().signin_plans.pop(key, None)
-    for a in get_account_db().execute("SELECT * FROM automations WHERE enabled=1 AND type='signin' ORDER BY id DESC").fetchall():
+    for a in get_account_db().execute("SELECT * FROM automations WHERE enabled=1 AND type IN ('signin','signin_poem') ORDER BY id DESC").fetchall():
         if a["id"] in get_runtime().auto_tasks:
             continue
         slot = _signin_slot(a, current, success_mask=_signin_mask(a, today))
@@ -11634,7 +11883,7 @@ async def toggle_rule(rid: int):
 
 # ---------- 自动化管理 (签到 / 抢注 / 抢红包 / 自定义) ----------
 class AutoIn(BaseModel):
-    type: str = "signin"          # signin | scheduled_register | grabcodes | redpacket | custom
+    type: str = "signin"          # signin | signin_poem | scheduled_register | grabcodes | redpacket | custom
     name: str = ""
     icon_url: str = Field("", max_length=2048)  # 任务图标，仅 HTTP(S)
     target: str = ""              # signin/custom: @机器人 或 群ID;grabcodes: 轮询机器人(可选)
@@ -11699,6 +11948,9 @@ class AutoIn(BaseModel):
     cc_username: str = Field("", max_length=64)
     cc_email: str = Field("", max_length=254)
     cc_last_code: str = Field("", max_length=128)
+    signin_poem_mode: int = Field(0, ge=0, le=1)  # 诗词群签到：第一句 command、第二句 reply_text、触发词 keywords
+    poem_box_wait: int = Field(12, ge=0, le=120)  # 签到成功后额外等待盲盒消息的秒数
+    poem_delete_on_success: int = Field(0, ge=0, le=1)  # 成功签到后删除任务发出的前两句诗词
     announcement_kw: str = "定时注册"
     announcement_button: str = "点击注册"
     ai_provider_ids: str = ""        # signin: 逗号分隔 provider id；空=全部启用
@@ -11708,7 +11960,7 @@ class AutoIn(BaseModel):
 
 
 def _valid_auto(body: AutoIn):
-    if body.type not in ("signin", "scheduled_register", "grabcodes", "redpacket", "custom", "keepalive", "link_register", "button_register", "code_register", "cc_register"):
+    if body.type not in ("signin", "signin_poem", "scheduled_register", "grabcodes", "redpacket", "custom", "keepalive", "link_register", "button_register", "code_register", "cc_register"):
         raise HTTPException(400, "未知任务类型")
     if not body.name.strip():
         raise HTTPException(400, "请填写任务名称")
@@ -11729,9 +11981,25 @@ def _valid_auto(body: AutoIn):
             raise HTTPException(400, "图标地址无效") from None
         if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.fragment or port == 0 or any(c.isspace() for c in body.icon_url):
             raise HTTPException(400, "图标仅支持不含凭据的 HTTP(S) 图片地址")
-    if body.type == "signin":
-        if not body.target.strip() or not body.command.strip():
+    if body.type in ("signin", "signin_poem"):
+        if not body.target.strip() or (body.type == "signin" and not body.command.strip()):
             raise HTTPException(400, "签到需要填写目标(@机器人)和命令")
+        if body.signin_poem_mode not in (0, 1):
+            raise HTTPException(400, "诗词群签到开关只能为 0 或 1")
+        if body.poem_delete_on_success not in (0, 1):
+            raise HTTPException(400, "签到成功后删除诗词开关只能为 0 或 1")
+        if body.poem_box_wait < 0 or body.poem_box_wait > 120:
+            raise HTTPException(400, "盲盒额外等待需在 0-120 秒之间")
+        if body.type == "signin_poem":
+            body.signin_poem_mode = 1
+            body.is_chat = 1
+        elif body.signin_poem_mode:
+            raise HTTPException(400, "诗词群签到请使用独立任务类型 signin_poem")
+        if body.type == "signin_poem":
+            if not body.keywords.strip():
+                raise HTTPException(400, "诗词群签到需要填写触发词（如：就位）")
+            if body.signin_recognition_mode.strip() not in ("", "none"):
+                raise HTTPException(400, "诗词群签到不能同时启用图片处理")
         if _win_minutes(body.win_start) is None or _win_minutes(body.win_end) is None:
             raise HTTPException(400, "时间窗口格式需为 hh:mm")
         if _win_minutes(body.win_start) >= _win_minutes(body.win_end):
@@ -11873,17 +12141,21 @@ def _valid_auto(body: AutoIn):
 _AUTO_COLS = ("type,name,target,command,win_start,win_end,click_btn,btn_text,btn_emoji,click_times,click_interval,"
               "success_kw,fail_kw,points_pat,is_chat,retries,signin_captcha,"
               "groups,keywords,action,reply_text,poll_interval,custom_steps,custom_trigger,chain_retry,cooldown,cooldown_unlimited,success_window_seconds,enabled,command_delay,button_delay,refresh_buttons,button_mode,popup_success_kw,popup_fail_kw,signin_independent,signin_second_enabled,signin_second_start,signin_second_end,icon_url,result_delay,result_timeout,scheduled_at,history_first,"
-              "link_mode,link_limit,link_wait,existing_kw,success_reply_enabled,success_reply_text,success_reply_delay,announcement_kw,announcement_button,ai_provider_ids,signin_recognition_mode,signin_image_prompt,signin_image_action,ai_flock_enabled,ai_flock_minutes,ai_flock_prompt,ai_flock_provider_ids,ai_flock_reaction,ai_flock_context_messages,ai_flock_message_chars,ai_flock_skill_chars,ai_flock_max_tokens,ai_flock_knowledge_chars,ai_flock_knowledge_on_demand,cc_username,cc_email,cc_last_code")
+              "link_mode,link_limit,link_wait,existing_kw,success_reply_enabled,success_reply_text,success_reply_delay,announcement_kw,announcement_button,ai_provider_ids,signin_recognition_mode,signin_image_prompt,signin_image_action,ai_flock_enabled,ai_flock_minutes,ai_flock_prompt,ai_flock_provider_ids,ai_flock_reaction,ai_flock_context_messages,ai_flock_message_chars,ai_flock_skill_chars,ai_flock_max_tokens,ai_flock_knowledge_chars,ai_flock_knowledge_on_demand,cc_username,cc_email,cc_last_code,signin_poem_mode,poem_box_wait,poem_delete_on_success")
 
 
 def _auto_vals(body: AutoIn, extra=None):
+    poem = body.type == "signin_poem"
+    success_kw = body.success_kw.strip() or ("签到成功" if poem else "")
+    points_pat = body.points_pat.strip() or (r"获得积分\s*(\d+)" if poem else "")
+    btn_text = body.btn_text.strip() or ("盲盒" if poem and body.click_btn else "")
     return [
         body.type, body.name.strip(), body.target.strip(),
         (body.command.strip() or "/start") if body.type == "button_register" else body.command.strip(),
         body.win_start.strip(), body.win_end.strip(), body.click_btn,
-        body.btn_text.strip(), body.btn_emoji.strip(), body.click_times, body.click_interval,
-        body.success_kw.strip(), body.fail_kw.strip(),
-        body.points_pat.strip(), body.is_chat, body.retries, body.signin_captcha,
+        btn_text, body.btn_emoji.strip(), body.click_times, body.click_interval,
+        success_kw, body.fail_kw.strip(),
+        points_pat, body.is_chat, body.retries, body.signin_captcha,
         body.groups.strip(), body.keywords.strip(), body.action, body.reply_text.strip(),
         body.poll_interval, canonical_steps(body.custom_steps) if body.type == "custom" else body.custom_steps.strip(),
         canonical_trigger(body.custom_trigger) if body.type == "custom" else body.custom_trigger.strip(), body.chain_retry,
@@ -11902,6 +12174,7 @@ def _auto_vals(body: AutoIn, extra=None):
         body.ai_flock_skill_chars, body.ai_flock_max_tokens, body.ai_flock_knowledge_chars,
         body.ai_flock_knowledge_on_demand,
         body.cc_username.strip(), body.cc_email.strip(), body.cc_last_code.strip(),
+        body.signin_poem_mode, body.poem_box_wait, body.poem_delete_on_success,
     ] + (extra or [])
 
 
@@ -11926,14 +12199,14 @@ async def list_autos():
     output = []
     for row in rows:
         start, end = _effective_signin_window(row)
-        mask = _signin_mask(row, today) if row["type"] == "signin" else 0
-        required = _signin_required_mask(row) if row["type"] == "signin" else 0
-        output.append(dict(row, signed_today=bool(row["type"] == "signin" and required and mask == required),
-            signin_done_slots=bin(mask).count("1"), signin_total_slots=len(_signin_window_spans(row)) if row["type"] == "signin" else 0,
-            effective_windows=_signin_windows(row) if row["type"] == "signin" else [(start, end)],
+        mask = _signin_mask(row, today) if _is_signin_type(row["type"]) else 0
+        required = _signin_required_mask(row) if _is_signin_type(row["type"]) else 0
+        output.append(dict(row, signed_today=bool(_is_signin_type(row["type"]) and required and mask == required),
+            signin_done_slots=bin(mask).count("1"), signin_total_slots=len(_signin_window_spans(row)) if _is_signin_type(row["type"]) else 0,
+            effective_windows=_signin_windows(row) if _is_signin_type(row["type"]) else [(start, end)],
             running=(row["id"] in _auto_runtime_state().auto_workers),
             queued=(row["id"] in _auto_runtime_state().auto_queued), last_result=results.get(row["id"]),
-            uses_global_window=(row["type"] == "signin" and window["enabled"] and not row["signin_independent"]),
+            uses_global_window=(_is_signin_type(row["type"]) and window["enabled"] and not row["signin_independent"]),
             effective_win_start=start, effective_win_end=end,
             link_credential_set=bool(get_link_credential(row["id"]).get("u"))))
     return {"autos": output}
@@ -11979,8 +12252,10 @@ async def update_auto(aid: int, body: AutoIn):
         ("custom_trigger", canonical_trigger(body.custom_trigger) if body.type == "custom" else body.custom_trigger.strip()),
         ("scheduled_at", body.scheduled_at.strip()), ("btn_text", body.btn_text.strip()),
         ("keywords", body.keywords.strip()), ("success_kw", body.success_kw.strip()),
+        ("signin_poem_mode", body.signin_poem_mode),
+        ("poem_delete_on_success", body.poem_delete_on_success),
         ("history_first", body.history_first)))
-    schedule_changed = body.type == "signin" and any(previous[key] != value for key, value in (
+    schedule_changed = _is_signin_type(body.type) and any(previous[key] != value for key, value in (
         ("win_start", body.win_start.strip()), ("win_end", body.win_end.strip()),
         ("signin_independent", body.signin_independent),
         ("signin_second_enabled", body.signin_second_enabled),
@@ -12076,7 +12351,7 @@ async def save_link_credential(aid: int, body: dict):
 @app.post("/api/autos/{aid}/run")
 async def run_auto_now(aid: int):
     """手动立即执行:signin/custom"""
-    a = get_account_db().execute("SELECT * FROM automations WHERE id=? AND type IN ('signin','custom','keepalive')", (aid,)).fetchone()
+    a = get_account_db().execute("SELECT * FROM automations WHERE id=? AND type IN ('signin','signin_poem','custom','keepalive')", (aid,)).fetchone()
     if not a:
         raise HTTPException(404, "该类型任务不可手动执行或不存在")
     if get_runtime().client is None or get_runtime().tg_state["phase"] != "ready":
@@ -12125,7 +12400,7 @@ async def test_scheduled_auto(aid: int):
 
 
 def _replay_targets(a):
-    if a["type"] in ("signin", "scheduled_register", "custom", "keepalive") and str(a["target"] or "").strip():
+    if a["type"] in ("signin", "signin_poem", "scheduled_register", "custom", "keepalive") and str(a["target"] or "").strip():
         return [str(a["target"]).strip()]
     groups = _csv(a["groups"])
     if not groups:
@@ -12135,7 +12410,9 @@ def _replay_targets(a):
 
 def _replay_plan(a):
     kind = a["type"]
-    if kind == "signin":
+    if kind == "signin_poem":
+        return ["发送第一句诗词", "发送第二句诗词", "发送触发词", "读取回复本任务消息的机器人结果", "只领取本任务回复上的盲盒"]
+    if _is_signin_type(kind):
         return ["发送签到指令", "按%s模式选择按钮" % a["button_mode"], "等待结果或识别图片"]
     if kind == "scheduled_register":
         return ["发送指令或检查历史卡片", "按%s模式选择注册按钮" % a["button_mode"], "回复配置内容", "确认成功关键词"]
@@ -12210,7 +12487,7 @@ async def replay_auto(aid: int):
             if entity is None:
                 sources.append({"target": target, "error": "目标无法解析", "messages": []})
                 continue
-            messages = await get_runtime().client.get_messages(entity, limit=12 if a["type"] in ("signin", "scheduled_register") else 3)
+            messages = await get_runtime().client.get_messages(entity, limit=12 if a["type"] in ("signin", "signin_poem", "scheduled_register") else 3)
             replays = [await _replay_message(message, a) for message in messages or []]
             # 只读试运行只需要"当前那条"：往前 12 条多是上几天的签到回显，没有诊断价值。
             useful = [item for item in replays if item["buttons"] or item["trigger_match"]]
@@ -12754,10 +13031,10 @@ async def resolve_anomaly(aid: int, body: dict):
         return {"ok": True, "action": action}
     today = now_local().strftime("%Y-%m-%d")
     if action == "confirm_success":
-        if row["type"] not in ("signin", "keepalive"):
+        if row["type"] not in ("signin", "signin_poem", "keepalive"):
             raise HTTPException(400, "仅签到或保号任务可人工确认成功")
-        stamp = today if row["type"] == "signin" else str(int(time.time()))
-        if row["type"] == "signin":
+        stamp = today if _is_signin_type(row["type"]) else str(int(time.time()))
+        if _is_signin_type(row["type"]):
             slot = _signin_slot(row, now_local(), allow_outside=True) or 0
             mask = _signin_mask(row, today) | (1 << slot)
             db.execute("UPDATE automations SET last_at=?,signin_success_mask=?,signin_attempt_slot=?,"
@@ -14074,7 +14351,7 @@ def _provider_references(provider_id, include_disabled=False):
                 if include_disabled or active:
                     references.append(f"{label} / 注册任务 {row['name']}")
         signins = db.execute("SELECT name,enabled,signin_captcha,signin_recognition_mode,ai_provider_ids "
-                             "FROM automations WHERE type='signin'").fetchall()
+                             "FROM automations WHERE type IN ('signin','signin_poem')").fetchall()
         for row in signins:
             ids = _csv(row["ai_provider_ids"])
             active = bool(row["enabled"] and _signin_recognition_mode(row) != "none")
@@ -14150,7 +14427,7 @@ def _reconcile_provider_ids(valid_ids=None):
                 db.execute("UPDATE automations SET ai_flock_enabled=0 WHERE rowid=?", (row["_rid"],))
                 runtime_changed += 1
         for row in db.execute("SELECT rowid AS _rid,ai_provider_ids,signin_recognition_mode,signin_captcha "
-                              "FROM automations WHERE type='signin'").fetchall():
+                              "FROM automations WHERE type IN ('signin','signin_poem')").fetchall():
             original = _csv(row["ai_provider_ids"])
             filtered = [item for item in original if item in valid_ids]
             if original and not filtered:

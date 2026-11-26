@@ -33,7 +33,7 @@ SAFE_COLUMNS = tuple((
     "type,name,target,command,win_start,win_end,click_btn,btn_text,btn_emoji,click_times,click_interval,"
     "success_kw,fail_kw,points_pat,is_chat,retries,signin_captcha,groups,keywords,action,reply_text,"
     "poll_interval,custom_steps,custom_trigger,chain_retry,cooldown,cooldown_unlimited,success_window_seconds,enabled,command_delay,button_delay,refresh_buttons,button_mode,popup_success_kw,popup_fail_kw,signin_independent,signin_second_enabled,signin_second_start,signin_second_end,icon_url,result_delay,result_timeout,scheduled_at,history_first,"
-    "link_mode,link_limit,link_wait,existing_kw,success_reply_enabled,success_reply_text,success_reply_delay,announcement_kw,announcement_button,ai_provider_ids,signin_recognition_mode,signin_image_prompt,signin_image_action,ai_flock_enabled,ai_flock_minutes,ai_flock_prompt,ai_flock_provider_ids,ai_flock_reaction,ai_flock_context_messages,ai_flock_message_chars,ai_flock_skill_chars,ai_flock_max_tokens,ai_flock_knowledge_chars,ai_flock_knowledge_on_demand,cc_username,cc_email,cc_last_code"
+    "link_mode,link_limit,link_wait,existing_kw,success_reply_enabled,success_reply_text,success_reply_delay,announcement_kw,announcement_button,ai_provider_ids,signin_recognition_mode,signin_image_prompt,signin_image_action,ai_flock_enabled,ai_flock_minutes,ai_flock_prompt,ai_flock_provider_ids,ai_flock_reaction,ai_flock_context_messages,ai_flock_message_chars,ai_flock_skill_chars,ai_flock_max_tokens,ai_flock_knowledge_chars,ai_flock_knowledge_on_demand,cc_username,cc_email,cc_last_code,signin_poem_mode,poem_box_wait,poem_delete_on_success"
 ).split(","))
 # Credentials are stored per-account in settings, never in task rows/exports.
 INTEGER_LIMITS = {
@@ -50,27 +50,30 @@ INTEGER_LIMITS = {
     "ai_flock_knowledge_chars": (-1, 5 * 1024 * 1024),
     "ai_flock_knowledge_on_demand": (0, 1),
     "signin_independent": (0, 1), "signin_second_enabled": (0, 1),
+    "signin_poem_mode": (0, 1), "poem_box_wait": (0, 120), "poem_delete_on_success": (0, 1),
 }
 # Only effective fields are applied; custom windows/delays are NOT scheduled.
+SIGNIN_TYPES = {"signin", "signin_poem"}
 APPLICABILITY = {
-    **{k: {"signin"} for k in ("win_start", "win_end", "command_delay", "button_delay", "result_delay",
+    **{k: SIGNIN_TYPES for k in ("win_start", "win_end", "command_delay", "button_delay", "result_delay",
                                "refresh_buttons", "click_btn", "btn_text", "btn_emoji",
                                "click_times", "click_interval")},
-    "button_mode": {"signin", "scheduled_register", "link_register", "button_register", "code_register", "redpacket"},
-    "popup_success_kw": {"signin"}, "popup_fail_kw": {"signin"},
-    **{key: {"signin"} for key in ("signin_independent", "signin_second_enabled",
-                                    "signin_second_start", "signin_second_end")},
-    "result_timeout": {"signin", "scheduled_register", "link_register", "button_register", "code_register"},
+    "button_mode": {"signin", "signin_poem", "scheduled_register", "link_register", "button_register", "code_register", "redpacket"},
+    "popup_success_kw": SIGNIN_TYPES, "popup_fail_kw": SIGNIN_TYPES,
+    **{key: SIGNIN_TYPES for key in ("signin_independent", "signin_second_enabled",
+                                    "signin_second_start", "signin_second_end",
+                                    "signin_poem_mode", "poem_box_wait", "poem_delete_on_success")},
+    "result_timeout": {"signin", "signin_poem", "scheduled_register", "link_register", "button_register", "code_register"},
     "scheduled_at": {"scheduled_register"},
     "history_first": {"scheduled_register"},
     "poll_interval": {"keepalive", "grabcodes"},
     "cooldown": {"keepalive", "grabcodes", "redpacket"},
-    "retries": {"signin", "custom", "keepalive"}, "chain_retry": {"custom"},
+    "retries": {"signin", "signin_poem", "custom", "keepalive"}, "chain_retry": {"custom"},
     "link_mode": {"link_register", "code_register"}, "link_limit": {"link_register", "code_register"}, "link_wait": {"link_register", "code_register"},
     "existing_kw": {"link_register", "button_register", "code_register"}, "success_reply_enabled": {"link_register", "button_register", "code_register", "redpacket"},
     "cooldown_unlimited": {"keepalive", "grabcodes", "redpacket"}, "success_window_seconds": {"redpacket"},
     "success_reply_text": {"link_register", "button_register", "code_register", "redpacket"}, "success_reply_delay": {"link_register", "button_register", "code_register", "redpacket"},
-    "ai_provider_ids": {"signin"},
+    "ai_provider_ids": SIGNIN_TYPES,
     "ai_flock_provider_ids": {"link_register", "button_register", "code_register"},
     "ai_flock_reaction": {"link_register", "button_register", "code_register"},
     **{key: {"link_register", "button_register", "code_register"} for key in
@@ -169,7 +172,7 @@ def _check_fields(data, allowed):
             maximum = 262144 if key in ("custom_steps", "custom_trigger") else 16384
             if not isinstance(value, str) or len(value) > maximum:
                 _bad(f"{key} 必须为字符串且不超过 {maximum} 字符")
-            if key == "type" and value not in ("signin", "scheduled_register", "grabcodes", "redpacket", "custom", "keepalive", "link_register", "button_register", "code_register", "cc_register"):
+            if key == "type" and value not in ("signin", "signin_poem", "scheduled_register", "grabcodes", "redpacket", "custom", "keepalive", "link_register", "button_register", "code_register", "cc_register"):
                 _bad("未知任务类型")
             if key == "action" and value not in ("reply", "send"):
                 _bad("任务 action 必须为 reply/send")
@@ -292,7 +295,7 @@ def build_task_router(get_db, auto_model, validate_auto, auto_values, auto_colum
         all_rows = selected(db, body.ids)
         rows, skipped_by_type = [], []
         for _row in all_rows:
-            if _row["type"] == "signin":
+            if _row["type"] in ("signin", "signin_poem"):
                 rows.append(_row)
             else:
                 skipped_by_type.append({"id": _row["id"], "name": _row.get("name") or _row["id"],
